@@ -1,0 +1,27 @@
+package puff
+version = 0.0.1
+authors = "Mathew Polzin"
+-- maintainers =
+-- license =
+-- brief =
+-- readme =
+-- homepage =
+-- sourceloc =
+-- bugtracker =
+
+-- depends =
+
+-- modules =
+
+main = Main
+
+executable = "puff"
+sourcedir = "src"
+-- opts =
+
+-- prebuild =
+-- postbuild =
+-- preinstall =
+-- postinstall =
+-- preclean =
+-- postclean =

@@ -1,0 +1,4 @@
+
+*.idr~
+build/
+.*.swp
