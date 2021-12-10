@@ -7,18 +7,22 @@ import Core.Context
 import Core.Context.Context
 import Core.Context.Log
 import Core.Core
+import Core.Directory
 import Core.Env
 import Core.FC
+import Core.InitPrimitives
+import Core.Metadata
 import Core.Name
 import Core.Normalise
 import Core.TT
+import Core.UnifyState
 import Core.Value
 
 import Data.List
 import Data.String
 
-import Idris.Doc.String
 import Idris.Desugar
+import Idris.Doc.String
 import Idris.Env
 import Idris.Error
 import Idris.IDEMode.Holes
@@ -124,4 +128,23 @@ setupEnv =
      Just cwd <- coreLift $ currentDir
           | Nothing => throw (InternalError "Can't get current directory")
      addLibDir cwd
+
+export
+setupCore : (entryFile : String) -> Core ?
+setupCore entryFile =
+  do c <- newRef Ctxt (!initDefs)
+     s <- newRef Syn initSyntax
+     setupEnv
+     addPrimitives
+     u <- newRef UST initUState
+     r <- newRef ROpts (defaultOpts (Just entryFile) (REPL InfoLvl) [])
+     setWorkingDir "."
+     origin <- ctxtPathToNS entryFile
+     m <- newRef MD (initMetadata $ PhysicalIdrSrc origin)
+     FileLoaded f <- loadMainFile entryFile
+       | REPLError err => throw $ GenericMsg EmptyFC $ show err
+       | ErrorLoadingFile f err => throw $ GenericMsg EmptyFC $ show err
+       | ErrorsBuildingFile f errs => throw $ GenericMsg EmptyFC $ show errs
+       | _ => throw $ GenericMsg EmptyFC "Failed to load main file."
+     pure (c,s,u,r,m)
 
