@@ -51,6 +51,8 @@ import System.File
 
 import Util
 
+%default covering
+
 die : String -> IO ()
 die msg =
   do putStrLn msg
@@ -101,6 +103,7 @@ inferAndElab emode itm
        ty <- getTerm gty
        pure (tm `WithType` ty)
 
+covering
 evalOneStep : {auto c : Ref Ctxt Defs} -> {vars : _} -> Defs -> Env Term vars -> Term vars -> Core (Term vars)
 evalOneStep = normaliseOpts ({ fuel := Just 1, strategy := CBV } withAll)
 
@@ -116,6 +119,7 @@ digFnArgs _ = Nothing
 ||| results.
 ||| Stops early if a term becomes neutral or normal.
 ||| Return the number of steps evaluated and the final result.
+covering
 evalN : {auto c : Ref Ctxt Defs} ->
         {auto u : Ref UST UState} ->
         {auto s : Ref Syn SyntaxInfo} ->
@@ -146,14 +150,35 @@ identifyApps : {auto c : Ref Ctxt Defs} ->
                {auto m : Ref MD Metadata} ->
                {auto o : Ref ROpts REPLOpts} ->
                {vars : _} ->
-               Fuel ->
                Env Term vars ->
                Term vars ->
                Core (List FC)
-identifyApps Dry _ _ = pure ([])
-identifyApps (More fuel) env (Bind fc x b scope) = identifyApps fuel (b :: env) scope
-identifyApps (More fuel) env (App fc fn arg) = pure [fc]
-identifyApps (More fuel) env tm = pure ([])
+identifyApps env (Bind fc x b scope) = identifyApps (b :: env) scope
+identifyApps env (App fc fn arg) = pure [fc]
+identifyApps env tm = pure ([])
+
+evalSubexpressions : {auto c : Ref Ctxt Defs} ->
+                     {auto u : Ref UST UState} ->
+                     {auto s : Ref Syn SyntaxInfo} ->
+                     {auto m : Ref MD Metadata} ->
+                     {auto o : Ref ROpts REPLOpts} ->
+                     {vars : _} ->
+                     Fuel ->
+                     Env Term vars ->
+                     Term vars ->
+                     Core (Nat, Term vars)
+evalSubexpressions Dry _ tm = pure (0, tm)
+evalSubexpressions (More fuel) env tm with (digFnArgs tm)
+  evalSubexpressions (More fuel) env tm | Nothing = evalN fuel 0 0 env tm
+  evalSubexpressions (More fuel) env tm | (Just (fc, fn, arg)) =
+    do [(MkFC o fp1 fp2)] <- identifyApps env arg
+         | _ => evalN fuel 0 0 env (App fc fn arg)
+       let p1 : Nat = cast $ snd fp1
+       let p2 : Nat = cast $ snd fp2
+       coreLift . putStrLn $ (String.replicate p1 ' ') ++ (String.replicate (p2 `minus` p1) '^')
+       (i, final) <- evalN fuel p1 0 env arg
+       iputStrLn $ pretty (String.replicate (p1 `minus` 3) ' ') <+> (fileCtxt $ pretty (String.replicate 7 '~'))
+       evalSubexpressions fuel env (App fc fn final)
 
 -- 1. dig
 --   if Nothing, regular eval loop.
@@ -170,17 +195,8 @@ trace entryFile pterm =
 
      iputStrLn $ Syntax <$> prettyTerm fullTm <++> pretty ":" <++> prettyTerm fullTy
 
-     whenJust (digFnArgs tm) $ \(fc, fn, args) => do
-       [(MkFC o fp1 fp2)] <- identifyApps (limit 10) [] args
-         | _ => throw $ GenericMsg EmptyFC "failed to find app FC"
-       let p1 : Nat = cast $ snd fp1
-       let p2 : Nat = cast $ snd fp2
-       coreLift . putStrLn $ (String.replicate p1 ' ') ++ (String.replicate (p2 `minus` p1) '^')
-       (i, final) <- evalN (limit 30) p1 0 [] args
-       iputStrLn $ pretty (String.replicate (p1 `minus` 3) ' ') <+> (fileCtxt $ pretty (String.replicate 7 '~'))
-       -- TMP: just running eval on the rest to test things out.
-       (i', final') <- evalN (limit 30) 0 0 [] (App fc fn final)
-       pure ()
+     (i, final) <- evalSubexpressions (limit 30) [] tm
+     pure ()
 
 parsePTerm : String -> Either Error (List Warning, State, PTerm)
 parsePTerm term = runParser (Virtual Interactive) Nothing term (expr plhs (Virtual Interactive) init)
