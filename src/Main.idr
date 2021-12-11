@@ -42,6 +42,7 @@ import TTImp.Elab
 import TTImp.Elab.Check
 import TTImp.PartialEval
 import TTImp.TTImp
+import TTImp.Unelab
 
 import Libraries.Text.PrettyPrint.Prettyprinter.Util
 
@@ -77,13 +78,13 @@ getItDecls
 
 ||| Produce the elaboration of a PTerm, along with its inferred type
 inferAndElab : {auto c : Ref Ctxt Defs} ->
-  {auto u : Ref UST UState} ->
-  {auto s : Ref Syn SyntaxInfo} ->
-  {auto m : Ref MD Metadata} ->
-  {auto o : Ref ROpts REPLOpts} ->
-  ElabMode ->
-  PTerm ->
-  Core TermWithType
+               {auto u : Ref UST UState} ->
+               {auto s : Ref Syn SyntaxInfo} ->
+               {auto m : Ref MD Metadata} ->
+               {auto o : Ref ROpts REPLOpts} ->
+               ElabMode ->
+               PTerm ->
+               Core TermWithType
 inferAndElab emode itm
   = do ttimp <- desugar AnyExpr [] itm
        let ttimpWithIt = ILocal replFC !getItDecls ttimp
@@ -106,29 +107,58 @@ evalOneStep = normaliseOpts ({ fuel := Just 1, strategy := CBV } withAll)
 Interpolation Nat where
   interpolate k = show k
 
+||| get the fn and its args as a tuple or else Nothing.
+digFnArgs : {vars : _} -> Term vars -> Maybe (FC, Term vars, Term vars)
+digFnArgs (App fc fn arg) = Just (fc, fn, arg)
+digFnArgs _ = Nothing
+
 ||| Evaluate for the given number of steps printing the intermediate
 ||| results.
 ||| Stops early if a term becomes neutral or normal.
 ||| Return the number of steps evaluated and the final result.
 evalN : {auto c : Ref Ctxt Defs} ->
-  {auto u : Ref UST UState} ->
-  {auto s : Ref Syn SyntaxInfo} ->
-  {auto m : Ref MD Metadata} ->
-  {auto o : Ref ROpts REPLOpts} ->
-  Fuel ->
-  (idx : Nat) ->
-  ClosedTerm ->
-  Core (Nat, ClosedTerm)
-evalN Dry k tm = pure (k, tm)
-evalN (More fuel) k tm =
+        {auto u : Ref UST UState} ->
+        {auto s : Ref Syn SyntaxInfo} ->
+        {auto m : Ref MD Metadata} ->
+        {auto o : Ref ROpts REPLOpts} ->
+        {vars : _} ->
+        Fuel ->
+        (indent : Nat) ->
+        (idx : Nat) ->
+        Env Term vars ->
+        Term vars ->
+        Core (Nat, Term vars)
+evalN Dry indent k env tm = pure (k, tm)
+evalN (More fuel) indent k env tm =
   do defs <- get Ctxt
-     tm' <- evalOneStep defs [] tm
      let outIdx = (S k)
-     if tm == tm'
+     let prfx = pretty $ padLeft indent ' ' "\{outIdx}: " 
+     tm'' <- evalOneStep defs env tm
+     if tm == tm''
         then pure (k, tm)
-        else do fullTm' <- resugar [] =<< toFullNames tm'
-                iputStrLn $ pretty "\{outIdx}:" <++> (Syntax <$> prettyTerm fullTm')
-                evalN fuel outIdx tm'
+        else do fullTm'' <- resugar env =<< toFullNames tm''
+                iputStrLn $ prfx <+> (Syntax <$> prettyTerm fullTm'')
+                evalN fuel indent outIdx env tm''
+
+identifyApps : {auto c : Ref Ctxt Defs} ->
+               {auto u : Ref UST UState} ->
+               {auto s : Ref Syn SyntaxInfo} ->
+               {auto m : Ref MD Metadata} ->
+               {auto o : Ref ROpts REPLOpts} ->
+               {vars : _} ->
+               Fuel ->
+               Env Term vars ->
+               Term vars ->
+               Core (List FC)
+identifyApps Dry _ _ = pure ([])
+identifyApps (More fuel) env (Bind fc x b scope) = identifyApps fuel (b :: env) scope
+identifyApps (More fuel) env (App fc fn arg) = pure [fc]
+identifyApps (More fuel) env tm = pure ([])
+
+-- 1. dig
+--   if Nothing, regular eval loop.
+--   else, eval on args and plop in place.
+-- 2. ?
 
 trace : (entryFile : String) -> PTerm -> Core ()
 trace entryFile pterm =
@@ -137,20 +167,30 @@ trace entryFile pterm =
      defs <- get Ctxt
      fullTm <- resugar [] =<< toFullNames tm
      fullTy <- resugar [] =<< toFullNames ty
+
      iputStrLn $ Syntax <$> prettyTerm fullTm <++> pretty ":" <++> prettyTerm fullTy
-     -- TODO: instead of an arbitrary limit of 30 steps, do chunks and then stop to
-     --       ask the user if we should continue.
-     (i, final) <- evalN (limit 30) 0 tm
-     when (i == 0) $
-       iputStrLn $ pretty "Nothing to evaluate."
-     pure ()
+
+     whenJust (digFnArgs tm) $ \(fc, fn, args) => do
+       [(MkFC o fp1 fp2)] <- identifyApps (limit 10) [] args
+         | _ => throw $ GenericMsg EmptyFC "failed to find app FC"
+       let p1 : Nat = cast $ snd fp1
+       let p2 : Nat = cast $ snd fp2
+       coreLift . putStrLn $ (String.replicate p1 ' ') ++ (String.replicate (p2 `minus` p1) '^')
+       (i, final) <- evalN (limit 30) p1 0 [] args
+       iputStrLn $ pretty (String.replicate (p1 `minus` 3) ' ') <+> (fileCtxt $ pretty (String.replicate 7 '~'))
+       -- TMP: just running eval on the rest to test things out.
+       (i', final') <- evalN (limit 30) 0 0 [] (App fc fn final)
+       pure ()
+
+parsePTerm : String -> Either Error (List Warning, State, PTerm)
+parsePTerm term = runParser (Virtual Interactive) Nothing term (expr plhs (Virtual Interactive) init)
 
 main : IO ()
 main =
   do (entryFile :: term) <- drop 1 <$> getArgs
        | _ => die "Expected filename and definition name as only arguments."
      let term' = unwords term
-     let Right (_, _, pterm) = runParser (Virtual Interactive) Nothing term' (expr plhs (Virtual Interactive) init)
+     let Right (_, _, pterm) = parsePTerm term'
        | Left err => die $ show err
      coreRun (trace entryFile pterm)
              (\err => die (show err))
