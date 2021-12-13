@@ -185,25 +185,27 @@ evalSubexpressions : {auto c : Ref Ctxt Defs} ->
                      {auto o : Ref ROpts REPLOpts} ->
                      {vars : _} ->
                      Fuel ->
+                     (top : Bool) ->
                      (depth : Nat) ->
                      Env Term vars ->
                      Term vars ->
                      Core (Nat, Term vars)
-evalSubexpressions Dry _ _ tm = pure (0, tm)
-evalSubexpressions (More fuel) depth env tm with (digFnArgs depth tm)
-  evalSubexpressions (More fuel) (S k) env tm | (Just (SIsNonZero, fc, fn, arg)) =
-    do (n, arg') <- evalSubexpressions fuel k env arg
+evalSubexpressions Dry _ _ _ tm = pure (0, tm)
+evalSubexpressions (More fuel) top depth env tm with (digFnArgs depth tm)
+  evalSubexpressions (More fuel) top (S k) env tm | (Just (SIsNonZero, fc, fn, arg)) =
+    do (n, arg') <- evalSubexpressions fuel top k env arg
        -- TODO: update the FC to account for a shorter drop in replacement
        --       (arg' where arg used to be).
        let (start, _) = startAndEnd fc
        prettyTm <- prettyTmTy env (App fc fn arg') Nothing
        iputStrLn . indent start . fileCtxt $ pretty "~~~~"
        iputStrLn . indent start $ prettyTm
-       mapFst (n +) <$> evalSubexpressions fuel 0 env (App fc fn arg')
-  evalSubexpressions (More fuel) _ env tm | _ =
+       mapFst (n +) <$> evalSubexpressions fuel False 0 env (App fc fn arg')
+  evalSubexpressions (More fuel) top _ env tm | _ =
     do (intermediates, final) <- evalN fuel [<] env tm
        let (start, end) = mapHom cast $ startAndEnd (getLoc tm)
-       coreLift . putStrLn $ (String.replicate start ' ') ++ (String.replicate (end `minus` start) '^')
+       when top $ do
+         coreLift . putStrLn $ (String.replicate start ' ') ++ (String.replicate (end `minus` start) '^')
        iputStrLn $ docSteps start intermediates
        pure (length intermediates, final)
 
@@ -219,7 +221,7 @@ trace entryFile depth pterm =
 
      iputStrLn =<< prettyTmTy [] tm (Just ty)
 
-     (n, final) <- evalSubexpressions (limit 30) depth [] tm
+     (n, final) <- evalSubexpressions (limit 30) True depth [] tm
      pure ()
 
 parsePTerm : String -> Either Error (List Warning, State, PTerm)
