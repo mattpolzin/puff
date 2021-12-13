@@ -53,13 +53,13 @@ import System.File
 
 import Util
 
-%default covering
-
+total
 die : String -> IO ()
 die msg =
   do putStrLn msg
      exitFailure
 
+total
 ambiguousName : List (Name, Int, GlobalDef) -> Core ()
 ambiguousName xs = throw $ AmbiguousName EmptyFC (fst <$> xs)
 
@@ -153,22 +153,35 @@ docSteps indent (x :: xs) = snd $ foldl1By docStep (document 1) (x ::: xs)
       let step = document (S idx) tm
       in  mapSnd (doc <+> hardline <+>) step
 
--- TODO: probably could be a nice traditional view of Term
--- allowing with pattern matching below to turn tm in an App.
+data FnArgs : (vars : List Name) -> (depth : Nat) -> Type where
+  FArgs : NonZero depth -> 
+          (fc : FC) -> 
+          (fn : Term vars) -> 
+          (arg : Term vars) -> 
+          FnArgs vars depth
+  Lambda : NonZero depth ->
+           (fc : FC) -> 
+           (name : Name) -> 
+           (b : Binder (Term vars)) -> 
+           (scope : Term (name :: vars)) -> 
+           FnArgs vars depth
+  NoArgs : FnArgs vars depth
+
 ||| get the next fn application and its args as a tuple or else Nothing.
-digFnArgs : {vars : _} -> (depth : Nat) -> Term vars -> Maybe (NonZero depth, FC, Term vars, Term vars)
-digFnArgs 0 _ = Nothing
-digFnArgs d@(S k) (App fc fn arg) = Just (SIsNonZero, fc, fn, arg)
--- digFnArgs (Bind fc x b scope) = ?h_3
-digFnArgs _ _ = Nothing
+total
+digFnArgs : (depth : Nat) -> Term vars -> FnArgs vars depth
+digFnArgs 0 _ = NoArgs
+digFnArgs d@(S k) (App fc fn arg) = FArgs SIsNonZero fc fn arg
+digFnArgs d@(S k) (Bind fc n b scope) = Lambda SIsNonZero fc n b scope
+digFnArgs _ _ = NoArgs
 
 prettyTmTy : {auto c : Ref Ctxt Defs} ->
-         {auto s : Ref Syn SyntaxInfo} ->
-         {vars : _} ->
-         Env Term vars ->
-         Term vars ->
-         (type : Maybe (Term vars)) ->
-         Core (Doc IdrisAnn)
+             {auto s : Ref Syn SyntaxInfo} ->
+             {vars : _} ->
+             Env Term vars ->
+             Term vars ->
+             (type : Maybe (Term vars)) ->
+             Core (Doc IdrisAnn)
 prettyTmTy env tm type =
   do fullTm <- resugar env =<< toFullNames tm
      maybeFullTy <- traverseOpt (resugar env <=< toFullNames) type
@@ -192,27 +205,29 @@ evalSubexpressions : {auto c : Ref Ctxt Defs} ->
                      Core (Nat, Term vars)
 evalSubexpressions Dry _ _ _ tm = pure (0, tm)
 evalSubexpressions (More fuel) top depth env tm with (digFnArgs depth tm)
-  evalSubexpressions (More fuel) top (S k) env tm | (Just (SIsNonZero, fc, fn, arg)) =
+  evalSubexpressions (More fuel) top (S k) env _ | (FArgs SIsNonZero fc fn arg) =
     do (n, arg') <- evalSubexpressions fuel top k env arg
-       -- TODO: update the FC to account for a shorter drop in replacement
-       --       (arg' where arg used to be).
        let (start, _) = startAndEnd fc
        prettyTm <- prettyTmTy env (App fc fn arg') Nothing
        iputStrLn . indent start . fileCtxt $ pretty "~~~~"
        iputStrLn . indent start $ prettyTm
        mapFst (n +) <$> evalSubexpressions fuel False 0 env (App fc fn arg')
-  evalSubexpressions (More fuel) top _ env tm | _ =
+
+  evalSubexpressions (More fuel) top (S k) env tm | (Lambda SIsNonZero fc name b scope) =
+    do (n, scope') <- evalSubexpressions fuel top k (b :: env) scope
+       let (start, _) = startAndEnd fc
+       prettyTm <- prettyTmTy env (Bind fc name b scope') Nothing
+       iputStrLn . indent start . fileCtxt $ pretty "~~~~"
+       iputStrLn . indent start $ prettyTm
+       mapFst (n +) <$> evalSubexpressions fuel False 0 env (Bind fc name b scope')
+
+  evalSubexpressions (More fuel) top _ env tm | NoArgs =
     do (intermediates, final) <- evalN fuel [<] env tm
        let (start, end) = mapHom cast $ startAndEnd (getLoc tm)
        when top $ do
          coreLift . putStrLn $ (String.replicate start ' ') ++ (String.replicate (end `minus` start) '^')
        iputStrLn $ docSteps start intermediates
        pure (length intermediates, final)
-
--- 1. dig
---   if Nothing, regular eval loop.
---   else, eval on args and plop in place.
--- 2. ?
 
 trace : (entryFile : String) -> (depth : Nat) -> PTerm -> Core ()
 trace entryFile depth pterm =
