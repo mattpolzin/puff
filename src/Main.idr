@@ -19,6 +19,8 @@ import Core.UnifyState
 import Core.Value
 
 import Data.List
+import Data.Nat
+import Data.SnocList
 import Data.String
 
 import Idris.Desugar
@@ -110,15 +112,10 @@ evalOneStep = normaliseOpts ({ fuel := Just 1, strategy := CBV } withAll)
 Interpolation Nat where
   interpolate k = show k
 
-||| get the fn and its args as a tuple or else Nothing.
-digFnArgs : {vars : _} -> Term vars -> Maybe (FC, Term vars, Term vars)
-digFnArgs (App fc fn arg) = Just (fc, fn, arg)
-digFnArgs _ = Nothing
-
-||| Evaluate for the given number of steps printing the intermediate
+||| Evaluate for the given number of steps returning the intermediate
 ||| results.
 ||| Stops early if a term becomes neutral or normal.
-||| Return the number of steps evaluated and the final result.
+||| Returns each step as a resugared term and the final result as a term.
 covering
 evalN : {auto c : Ref Ctxt Defs} ->
         {auto u : Ref UST UState} ->
@@ -127,35 +124,59 @@ evalN : {auto c : Ref Ctxt Defs} ->
         {auto o : Ref ROpts REPLOpts} ->
         {vars : _} ->
         Fuel ->
-        (indent : Nat) ->
-        (idx : Nat) ->
+        (acc : SnocList IPTerm) ->
         Env Term vars ->
         Term vars ->
-        Core (Nat, Term vars)
-evalN Dry indent k env tm = pure (k, tm)
-evalN (More fuel) indent k env tm =
+        Core (List IPTerm, Term vars)
+evalN Dry acc env tm = pure (cast acc, tm)
+evalN (More fuel) acc env tm =
   do defs <- get Ctxt
-     let outIdx = (S k)
-     let prfx = pretty $ padLeft indent ' ' "\{outIdx}: " 
      tm'' <- evalOneStep defs env tm
      if tm == tm''
-        then pure (k, tm)
+        then pure (cast acc, tm)
         else do fullTm'' <- resugar env =<< toFullNames tm''
-                iputStrLn $ prfx <+> (Syntax <$> prettyTerm fullTm'')
-                evalN fuel indent outIdx env tm''
+                evalN fuel (acc :< fullTm'') env tm''
 
-identifyApps : {auto c : Ref Ctxt Defs} ->
-               {auto u : Ref UST UState} ->
-               {auto s : Ref Syn SyntaxInfo} ->
-               {auto m : Ref MD Metadata} ->
-               {auto o : Ref ROpts REPLOpts} ->
-               {vars : _} ->
-               Env Term vars ->
-               Term vars ->
-               Core (List FC)
-identifyApps env (Bind fc x b scope) = identifyApps (b :: env) scope
-identifyApps env (App fc fn arg) = pure [fc]
-identifyApps env tm = pure ([])
+||| Take a list of evaluation steps and document them line by line
+||| with index numbers prefixed to them and the given indentation.
+docSteps : (indent : Nat) -> List IPTerm -> Doc IdrisAnn
+docSteps indent [] = emptyDoc
+docSteps indent (x :: xs) = snd $ foldl1By docStep (document 1) (x ::: xs)
+  where
+    document : Nat -> IPTerm -> (Nat, Doc IdrisAnn)
+    document k tm =
+      let prfx = pretty $ padLeft indent ' ' "\{k}: " 
+      in  (k, prfx <+> (Syntax <$> prettyTerm tm))
+
+    docStep : (Nat, Doc IdrisAnn) -> IPTerm -> (Nat, Doc IdrisAnn)
+    docStep (idx, doc) tm =
+      let step = document (S idx) tm
+      in  mapSnd (doc <+> hardline <+>) step
+
+-- TODO: probably could be a nice traditional view of Term
+-- allowing with pattern matching below to turn tm in an App.
+||| get the next fn application and its args as a tuple or else Nothing.
+digFnArgs : {vars : _} -> (depth : Nat) -> Term vars -> Maybe (NonZero depth, FC, Term vars, Term vars)
+digFnArgs 0 _ = Nothing
+digFnArgs d@(S k) (App fc fn arg) = Just (SIsNonZero, fc, fn, arg)
+-- digFnArgs (Bind fc x b scope) = ?h_3
+digFnArgs _ _ = Nothing
+
+prettyTmTy : {auto c : Ref Ctxt Defs} ->
+         {auto s : Ref Syn SyntaxInfo} ->
+         {vars : _} ->
+         Env Term vars ->
+         Term vars ->
+         (type : Maybe (Term vars)) ->
+         Core (Doc IdrisAnn)
+prettyTmTy env tm type =
+  do fullTm <- resugar env =<< toFullNames tm
+     maybeFullTy <- traverseOpt (resugar env <=< toFullNames) type
+     let fullTy = maybe emptyDoc ((pretty ":" <++>) . prettyTerm) maybeFullTy
+     pure $ Syntax <$> prettyTerm fullTm <++> fullTy
+
+startAndEnd : FC -> (Int, Int)
+startAndEnd = maybe (0,0) (bimap startCol endCol . dup) . isNonEmptyFC
 
 evalSubexpressions : {auto c : Ref Ctxt Defs} ->
                      {auto u : Ref UST UState} ->
@@ -164,38 +185,41 @@ evalSubexpressions : {auto c : Ref Ctxt Defs} ->
                      {auto o : Ref ROpts REPLOpts} ->
                      {vars : _} ->
                      Fuel ->
+                     (depth : Nat) ->
                      Env Term vars ->
                      Term vars ->
                      Core (Nat, Term vars)
-evalSubexpressions Dry _ tm = pure (0, tm)
-evalSubexpressions (More fuel) env tm with (digFnArgs tm)
-  evalSubexpressions (More fuel) env tm | Nothing = evalN fuel 0 0 env tm
-  evalSubexpressions (More fuel) env tm | (Just (fc, fn, arg)) =
-    do [(MkFC o fp1 fp2)] <- identifyApps env arg
-         | _ => evalN fuel 0 0 env (App fc fn arg)
-       let p1 : Nat = cast $ snd fp1
-       let p2 : Nat = cast $ snd fp2
-       coreLift . putStrLn $ (String.replicate p1 ' ') ++ (String.replicate (p2 `minus` p1) '^')
-       (i, final) <- evalN fuel p1 0 env arg
-       iputStrLn $ pretty (String.replicate (p1 `minus` 3) ' ') <+> (fileCtxt $ pretty (String.replicate 7 '~'))
-       evalSubexpressions fuel env (App fc fn final)
+evalSubexpressions Dry _ _ tm = pure (0, tm)
+evalSubexpressions (More fuel) depth env tm with (digFnArgs depth tm)
+  evalSubexpressions (More fuel) (S k) env tm | (Just (SIsNonZero, fc, fn, arg)) =
+    do (n, arg') <- evalSubexpressions fuel k env arg
+       -- TODO: update the FC to account for a shorter drop in replacement
+       --       (arg' where arg used to be).
+       let (start, _) = startAndEnd fc
+       prettyTm <- prettyTmTy env (App fc fn arg') Nothing
+       iputStrLn . indent start . fileCtxt $ pretty "~~~~"
+       iputStrLn . indent start $ prettyTm
+       mapFst (n +) <$> evalSubexpressions fuel 0 env (App fc fn arg')
+  evalSubexpressions (More fuel) _ env tm | _ =
+    do (intermediates, final) <- evalN fuel [<] env tm
+       let (start, end) = mapHom cast $ startAndEnd (getLoc tm)
+       coreLift . putStrLn $ (String.replicate start ' ') ++ (String.replicate (end `minus` start) '^')
+       iputStrLn $ docSteps start intermediates
+       pure (length intermediates, final)
 
 -- 1. dig
 --   if Nothing, regular eval loop.
 --   else, eval on args and plop in place.
 -- 2. ?
 
-trace : (entryFile : String) -> PTerm -> Core ()
-trace entryFile pterm =
+trace : (entryFile : String) -> (depth : Nat) -> PTerm -> Core ()
+trace entryFile depth pterm =
   do _ <- setupCore entryFile
      (tm `WithType` ty) <- inferAndElab InExpr pterm
-     defs <- get Ctxt
-     fullTm <- resugar [] =<< toFullNames tm
-     fullTy <- resugar [] =<< toFullNames ty
 
-     iputStrLn $ Syntax <$> prettyTerm fullTm <++> pretty ":" <++> prettyTerm fullTy
+     iputStrLn =<< prettyTmTy [] tm (Just ty)
 
-     (i, final) <- evalSubexpressions (limit 30) [] tm
+     (n, final) <- evalSubexpressions (limit 30) depth [] tm
      pure ()
 
 parsePTerm : String -> Either Error (List Warning, State, PTerm)
@@ -203,12 +227,14 @@ parsePTerm term = runParser (Virtual Interactive) Nothing term (expr plhs (Virtu
 
 main : IO ()
 main =
-  do (entryFile :: term) <- drop 1 <$> getArgs
-       | _ => die "Expected filename and definition name as only arguments."
+  do (entryFile :: depth :: term) <- drop 1 <$> getArgs
+       | _ => die "Expected filename, depth, and term as arguments."
+     let Just depth' = parsePositive depth
+       | Nothing => die "The second argument must be a non-negative number."
      let term' = unwords term
      let Right (_, _, pterm) = parsePTerm term'
        | Left err => die $ show err
-     coreRun (trace entryFile pterm)
+     coreRun (trace entryFile depth' pterm)
              (\err => die (show err))
              (\res => pure ())
      pure ()
